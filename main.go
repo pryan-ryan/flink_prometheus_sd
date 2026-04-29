@@ -6,17 +6,18 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io"
-	"io/ioutil"
 	"log"
 	"net"
 	"net/http"
 	"net/url"
+	"io"
 	"os"
 	"regexp"
 	"strings"
 	"sync"
 	"time"
+	"crypto/tls"
+	"crypto/x509"
 )
 
 // AppResponse ..
@@ -102,29 +103,40 @@ const (
 
 // var ...
 var (
-	targetFolder = flag.String("folder", "", "Provided target folder for writing json targets")
-	logFile      = flag.String("log-file", "", "Provided log file path")
-	yarnAddr     = flag.String("address", "", "Provided yarn resource manager address for service discovery mode")
-	appID        = flag.String("app-id", "", "If specified, this program runs once for the application. Otherwise, it runs as a service.")
-	queryTimeout = flag.Int("timeout", 15, "HTTP query timeout in seconds.")
-	pollInterval = flag.Int("poll-interval", 30, "Polling interval to YARN in seconds.")
-	debugMode    = flag.Bool("debug", false, "Enable debug mode")
+	targetFolder    = flag.String("folder", "", "Provided target folder for writing json targets")
+	logFile         = flag.String("log-file", "", "Provided log file path")
+	yarnAddr        = flag.String("address", "", "Provided yarn resource manager address")
+	appID           = flag.String("app-id", "", "If specified, runs once for the application")
+	queryTimeout    = flag.Int("timeout", 15, "HTTP query timeout in seconds")
+	pollInterval    = flag.Int("poll-interval", 30, "Polling interval to YARN in seconds")
+	debugMode       = flag.Bool("debug", false, "Enable debug mode")
+	// Auth
+	basicUser       = flag.String("username", "", "Basic auth username")
+	basicPass       = flag.String("password", "", "Basic auth password")
+	bearerToken     = flag.String("token", "", "Bearer token for Authorization header")
+	// TLS
+	tlsCACert       = flag.String("tls-ca-cert", "", "Path to CA certificate")
+	tlsClientCert   = flag.String("tls-client-cert", "", "Path to client certificate")
+	tlsClientKey    = flag.String("tls-client-key", "", "Path to client key")
+	tlsSkipVerify   = flag.Bool("tls-skip-verify", false, "Skip TLS certificate verification")
 )
 
 func main() {
 	flag.Parse()
 
-	// Args ...
 	if *yarnAddr == "" {
 		flag.PrintDefaults()
 		os.Exit(1)
 	}
 
-	if !strings.Contains(*yarnAddr, "http://") {
-		*yarnAddr = "http://" + *yarnAddr
+	if !strings.HasPrefix(*yarnAddr, "http://") && !strings.HasPrefix(*yarnAddr, "https://") {
+	log.Fatal("Please specify the protocol (http:// or https://) in the --address flag")
 	}
 	*yarnAddr = strings.TrimRight(*yarnAddr, "/")
 	*targetFolder = strings.TrimRight(*targetFolder, "/")
+
+	// Initialise shared HTTP client (TLS + auth)
+	sharedClient = buildHTTPClient()
 
 	// Log file
 	f, err := os.OpenFile(*logFile, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
@@ -147,7 +159,6 @@ func main() {
 	var curApps, prevApps, addedApps, removedApps []App
 	ticker := time.NewTicker(time.Second * time.Duration(*pollInterval))
 	for range ticker.C {
-		// Get running flink apps
 		curApps = GetListFlinkApps()
 
 		for i, app := range curApps {
@@ -158,7 +169,6 @@ func main() {
 		if len(prevApps) != 0 {
 			addedApps = difference(curApps, prevApps)
 			removedApps = difference(prevApps, curApps)
-			// Update existing json file
 			for i := range curApps {
 				for j := range prevApps {
 					if curApps[i].ID == prevApps[j].ID {
@@ -166,7 +176,6 @@ func main() {
 						curLastAttemptID := curApps[i].LastAttemptID
 						prevLastAttemptID := prevApps[j].LastAttemptID
 						if curLastAttemptID > prevLastAttemptID {
-							//Overwrite old file
 							log.Println("---- Update status ----")
 							log.Println("Running apps: ", len(curApps))
 							log.Printf("Detected change in existing app. AppID: %s - (AttemptID: %d => %d)\n", appID, prevLastAttemptID, curLastAttemptID)
@@ -176,7 +185,6 @@ func main() {
 				}
 			}
 		} else {
-			// 1st time run
 			addedApps = curApps
 		}
 
@@ -186,7 +194,6 @@ func main() {
 			log.Println("New apps: ", len(addedApps))
 			log.Println("Removed apps: ", len(removedApps))
 
-			// Write new json files
 			for _, app := range addedApps {
 				if *debugMode {
 					CreateJSONFile(app)
@@ -194,7 +201,6 @@ func main() {
 				}
 				go CreateJSONFile(app)
 			}
-			// Remove old json files
 			for _, app := range removedApps {
 				removeJSONFile(app.ID)
 			}
@@ -202,6 +208,40 @@ func main() {
 		prevApps = curApps
 	}
 }
+
+//shared client builder
+func buildHTTPClient() *http.Client {
+	tlsCfg := &tls.Config{
+		InsecureSkipVerify: *tlsSkipVerify,
+	}
+
+	if *tlsCACert != "" {
+		caCert, err := os.ReadFile(*tlsCACert)
+		if err != nil {
+			log.Fatalf("Failed to read CA cert: %v", err)
+		}
+		caCertPool := x509.NewCertPool()
+		caCertPool.AppendCertsFromPEM(caCert)
+		tlsCfg.RootCAs = caCertPool
+	}
+
+	if *tlsClientCert != "" && *tlsClientKey != "" {
+		cert, err := tls.LoadX509KeyPair(*tlsClientCert, *tlsClientKey)
+		if err != nil {
+			log.Fatalf("Failed to load client cert/key: %v", err)
+		}
+		tlsCfg.Certificates = []tls.Certificate{cert}
+	}
+
+	return &http.Client{
+		Timeout: time.Second * time.Duration(*queryTimeout),
+		Transport: &http.Transport{
+			TLSClientConfig: tlsCfg,
+		},
+	}
+}
+
+var sharedClient *http.Client
 
 // CreateJSONFile create json file based on appID
 func CreateJSONFile(app App) {
@@ -419,12 +459,9 @@ func GetJobManangerAddr(appID string) (jobManager Host) {
 	ctx, cancel = context.WithTimeout(ctx, time.Duration(*queryTimeout)*time.Second)
 	defer cancel()
 
-	var netClient = &http.Client{
-		Timeout: time.Second * time.Duration(*queryTimeout),
-	}
 
 	req = req.WithContext(ctx)
-	resp, err := netClient.Do(req)
+	resp, err := sharedClient.Do(req)
 
 	if err != nil {
 		log.Println(err)
@@ -522,11 +559,8 @@ func GetTaskManangerAddr(appID string, tm TaskManager, result chan Host, waitGro
 	ctx, cancel := context.WithTimeout(ctx, time.Duration(*queryTimeout)*time.Second)
 	defer cancel()
 
-	var netClient = &http.Client{
-		Timeout: time.Second * time.Duration(*queryTimeout),
-	}
 	req = req.WithContext(ctx)
-	resp, err := netClient.Do(req)
+	resp, err := sharedClient.Do(req)
 
 	if err != nil {
 		log.Println(err)
@@ -558,25 +592,24 @@ func GetTaskManangerAddr(appID string, tm TaskManager, result chan Host, waitGro
 }
 
 func newGetRequest(path string) (*http.Request, error) {
-	url := fmt.Sprintf(*yarnAddr + path)
+	url := *yarnAddr + path
 	req, err := http.NewRequest("GET", url, nil)
-
 	if err != nil {
 		return nil, err
 	}
-
 	req.Header.Set("Accept", "application/json")
+
+	if *bearerToken != "" {
+		req.Header.Set("Authorization", "Bearer "+*bearerToken)
+	} else if *basicUser != "" {
+		req.SetBasicAuth(*basicUser, *basicPass)
+	}
 	return req, nil
 }
 
 func do(ctx context.Context, req *http.Request, v interface{}) error {
-	var netClient = &http.Client{
-		Timeout: time.Second * time.Duration(*queryTimeout),
-	}
-
 	req = req.WithContext(ctx)
-	resp, err := netClient.Do(req)
-
+	resp, err := sharedClient.Do(req)
 	if err != nil {
 		select {
 		case <-ctx.Done():
@@ -588,10 +621,7 @@ func do(ctx context.Context, req *http.Request, v interface{}) error {
 	defer resp.Body.Close()
 
 	if v != nil {
-		err = json.NewDecoder(resp.Body).Decode(v)
-		if err != nil {
-			//bodyBytes, _ := ioutil.ReadAll(resp.Body)
-			//log.Printf("Debug http client: %s\n", string(bodyBytes))
+		if err = json.NewDecoder(resp.Body).Decode(v); err != nil {
 			return err
 		}
 	}
@@ -637,7 +667,7 @@ func writeJSONFile(jsonFile JSONFile) error {
 			return err
 		}
 		outputFile := *targetFolder + "/" + jsonFile.Labels.App + ".json"
-		err = ioutil.WriteFile(outputFile, jsonBytes, 0644)
+		err = os.WriteFile(outputFile, jsonBytes, 0644)
 		if err != nil {
 			log.Println(err)
 		}
