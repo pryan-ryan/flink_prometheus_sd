@@ -18,6 +18,10 @@ import (
 	"time"
 	"crypto/tls"
 	"crypto/x509"
+	"github.com/jcmturner/gokrb5/v8/client"
+	"github.com/jcmturner/gokrb5/v8/config"
+	"github.com/jcmturner/gokrb5/v8/keytab"
+	"github.com/jcmturner/gokrb5/v8/spnego"
 )
 
 // AppResponse ..
@@ -60,7 +64,7 @@ type App struct {
 	Name              string `json:"name"`
 	State             string `json:"state"`
 	AppType           string `json:"applicationType"`
-	TrackingURL       string `json:"trackingURL"`
+	TrackingURL       string `json:"trackingUrl"`
 	RunningContainers int    `json:"runningContainers"`
 	LastAttemptID     int
 }
@@ -94,6 +98,22 @@ type JSONFile struct {
 	Targets []string `json:"targets"`
 }
 
+// New structs
+type ContainerListResponse struct {
+    Container []YARNContainer `json:"container"`
+}
+
+type YARNContainer struct {
+    ContainerID   string `json:"containerId"`
+    NodeID        string `json:"nodeId"`        // host:port
+    ContainerType string `json:"containerType"` // APPLICATION_MASTER or TASK
+}
+
+type spnegoRoundTripper struct {
+    client *spnego.Client
+}
+
+
 // const ..
 const (
 	JobLabel           = "flink_yarn"
@@ -119,6 +139,14 @@ var (
 	tlsClientCert   = flag.String("tls-client-cert", "", "Path to client certificate")
 	tlsClientKey    = flag.String("tls-client-key", "", "Path to client key")
 	tlsSkipVerify   = flag.Bool("tls-skip-verify", false, "Skip TLS certificate verification")
+	useKerberos        = flag.Bool("use-kerberos", false, "Use Kerberos SPNEGO, bypasses Knox")
+	kerberosKeytab     = flag.String("keytab", "", "Path to Kerberos keytab file")
+	kerberosPrincipal  = flag.String("principal", "", "Kerberos principal e.g. user@REALM")
+	krb5ConfPath       = flag.String("krb5-conf", "/etc/krb5.conf", "Path to krb5.conf")
+	// New flags (add to var block)
+	yarnTimelineHost  = flag.String("yarn-timeline-host", "", "YARN Timeline Server host for log access (defaults to Knox host)")
+	yarnTimelinePort  = flag.String("yarn-timeline-port", "19890", "YARN Timeline Server port")
+	knoxTopologyPath  = flag.String("knox-log-path", "/cdp-proxy-api/yarnuiv2/timeline", "Knox path to yarnuiv2 timeline topology")
 )
 
 func main() {
@@ -136,7 +164,12 @@ func main() {
 	*targetFolder = strings.TrimRight(*targetFolder, "/")
 
 	// Initialise shared HTTP client (TLS + auth)
-	sharedClient = buildHTTPClient()
+	if *useKerberos {
+	    sharedClient = buildKerberosClient()
+	    log.Println("Using Kerberos SPNEGO authentication (direct YARN endpoints)")
+	} else {
+	    sharedClient = buildHTTPClient()
+	}
 
 	// Log file
 	f, err := os.OpenFile(*logFile, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
@@ -241,9 +274,60 @@ func buildHTTPClient() *http.Client {
 	}
 }
 
+func (s *spnegoRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+    return s.client.Do(req)
+}
+
+func buildKerberosClient() *http.Client {
+    krb5Cfg, err := config.Load(*krb5ConfPath)
+    if err != nil {
+        log.Fatalf("Failed to load krb5.conf: %v", err)
+    }
+
+    kt, err := keytab.Load(*kerberosKeytab)
+    if err != nil {
+        log.Fatalf("Failed to load keytab: %v", err)
+    }
+
+    parts := strings.SplitN(*kerberosPrincipal, "@", 2)
+    if len(parts) != 2 {
+        log.Fatalf("Invalid principal format, expected user@REALM, got: %s", *kerberosPrincipal)
+    }
+
+    krb5Client := client.NewWithKeytab(parts[0], parts[1], kt, krb5Cfg,
+        client.DisablePAFXFAST(true),
+    )
+
+    if err := krb5Client.Login(); err != nil {
+        log.Fatalf("Kerberos login failed: %v", err)
+    }
+    log.Printf("Kerberos login successful for principal: %s", *kerberosPrincipal)
+
+    tlsCfg := &tls.Config{InsecureSkipVerify: *tlsSkipVerify}
+    if *tlsCACert != "" {
+        caCert, err := os.ReadFile(*tlsCACert)
+        if err != nil {
+            log.Fatalf("Failed to read CA cert: %v", err)
+        }
+        pool := x509.NewCertPool()
+        pool.AppendCertsFromPEM(caCert)
+        tlsCfg.RootCAs = pool
+    }
+
+    // spnego.NewClient requires an *http.Client, not *http.Transport
+    baseClient := &http.Client{
+        Transport: &http.Transport{TLSClientConfig: tlsCfg},
+    }
+    spnegoClient := spnego.NewClient(krb5Client, baseClient, "")
+
+    return &http.Client{
+        Timeout:   time.Second * time.Duration(*queryTimeout),
+        Transport: &spnegoRoundTripper{client: spnegoClient},
+    }
+}
+
 var sharedClient *http.Client
 
-// CreateJSONFile create json file based on appID
 func CreateJSONFile(app App) {
 	jsonInfo := GetFlinkClusterInfo(app)
 	err := writeJSONFile(jsonInfo)
@@ -254,6 +338,60 @@ func CreateJSONFile(app App) {
 	log.Printf("App ID: %s - Write file successfully\n", app.ID)
 }
 
+func newGetRequest(path string) (*http.Request, error) {
+    reqURL := *yarnAddr + path
+    req, err := http.NewRequest("GET", reqURL, nil)
+    if err != nil {
+        return nil, err
+    }
+    req.Header.Set("Accept", "application/json")
+    if !*useKerberos {
+        if *bearerToken != "" {
+            req.Header.Set("Authorization", "Bearer "+*bearerToken)
+        } else if *basicUser != "" {
+            req.SetBasicAuth(*basicUser, *basicPass)
+        }
+    }
+    return req, nil
+}
+
+func newProxyRequest(app App, path string) (*http.Request, error) {
+    var rawURL string
+    if *useKerberos {
+        u, err := url.Parse(*yarnAddr)
+        if err != nil {
+            return nil, fmt.Errorf("failed to parse yarnAddr: %w", err)
+        }
+        rawURL = u.Scheme + "://" + u.Host + "/proxy/" + app.ID + path
+    } else {
+        base, err := url.Parse(app.TrackingURL)
+        if err != nil {
+            return nil, fmt.Errorf("failed to parse trackingUrl: %w", err)
+        }
+        proxyURL := &url.URL{
+            Scheme:   base.Scheme,
+            Host:     base.Host,
+            Path:     strings.TrimRight(base.Path, "/") + path,
+            RawQuery: base.RawQuery,
+        }
+        rawURL = proxyURL.String()
+    }
+
+    req, err := http.NewRequest("GET", rawURL, nil)
+    if err != nil {
+        return nil, err
+    }
+    req.Header.Set("Accept", "application/json")
+    if !*useKerberos {
+        if *bearerToken != "" {
+            req.Header.Set("Authorization", "Bearer "+*bearerToken)
+        } else if *basicUser != "" {
+            req.SetBasicAuth(*basicUser, *basicPass)
+        }
+    }
+    return req, nil
+}
+
 // GetFlinkClusterInfo gets list of JM and TMs of one Flink Cluster
 func GetFlinkClusterInfo(app App) (result JSONFile) {
 	hostList := []Host{}
@@ -261,9 +399,9 @@ func GetFlinkClusterInfo(app App) (result JSONFile) {
 	tries, tmCount := 0, 0
 
 	// Waiting until get JM address
-	jmAddr := GetJobManangerAddr(app.ID)
+	jmAddr := GetJobManangerAddr(app)
 	for len(jmAddr.IP) == 0 {
-		jmAddr = GetJobManangerAddr(app.ID)
+		jmAddr = GetJobManangerAddr(app)
 		if len(jmAddr.IP) != 0 || tries >= MaxTries {
 			time.Sleep(time.Second)
 			break
@@ -275,7 +413,7 @@ func GetFlinkClusterInfo(app App) (result JSONFile) {
 	// Get TM ID count
 	tries = 0
 	for tmCount == 0 {
-		tmCount = FlinkClusterOverview(app.ID).TMCount
+		tmCount = FlinkClusterOverview(app).TMCount
 		if tmCount == 0 {
 			tries++
 			time.Sleep(time.Second)
@@ -287,7 +425,7 @@ func GetFlinkClusterInfo(app App) (result JSONFile) {
 	}
 
 	// Get TM ID list
-	tmIDList := GetTaskManagerList(app.ID)
+	tmIDList := GetTaskManagerList(app)
 	log.Printf("TMCount Tracking - App ID: %s - %d/%d TMs\n", app.ID, len(tmIDList), tmCount)
 
 	//Keeping loop until get all TM addresses
@@ -302,7 +440,7 @@ func GetFlinkClusterInfo(app App) (result JSONFile) {
 			DebugMsg("Enter go routine")
 			// Add to waitGroup
 			waitGroup.Add(1)
-			go GetTaskManangerAddr(app.ID, tm, tmAddr, &waitGroup)
+			go GetTaskManangerAddr(app, tm, tmAddr, &waitGroup)
 		}
 		DebugMsg("Back to main")
 
@@ -345,7 +483,7 @@ func GetFlinkClusterInfo(app App) (result JSONFile) {
 func GetListFlinkApps() (flinkApps []App) {
 	var clusterApp ClusterApp
 
-	req, err := newGetRequest("/ws/v1/cluster/apps")
+	req, err := newGetRequest("/v1/cluster/apps")
 	if err != nil {
 		log.Println(err)
 		return
@@ -378,7 +516,7 @@ func GetListFlinkApps() (flinkApps []App) {
 // GetFlinkApp one flink app info
 func GetFlinkApp(appID string) (flinkApp App) {
 	var appResp AppResponse
-	req, err := newGetRequest("/ws/v1/cluster/apps/" + appID)
+	req, err := newGetRequest("/v1/cluster/apps/" + appID)
 
 	if err != nil {
 		log.Println(err)
@@ -399,8 +537,8 @@ func GetFlinkApp(appID string) (flinkApp App) {
 }
 
 // FlinkClusterOverview ...
-func FlinkClusterOverview(appID string) (flinkOverview FlinkOverview) {
-	req, err := newGetRequest("/proxy/" + appID + "/overview")
+func FlinkClusterOverview(app App) (flinkOverview FlinkOverview) {
+	req, err := newProxyRequest(app, "/overview")
 
 	if err != nil {
 		log.Println(err)
@@ -414,17 +552,17 @@ func FlinkClusterOverview(appID string) (flinkOverview FlinkOverview) {
 
 	err = do(ctx, req, &flinkOverview)
 	if err != nil {
-		log.Printf("Error when unmarshall flink cluster overview, id= %s, err= %s\n", appID, err)
+		log.Printf("Error when unmarshall flink cluster overview, id= %s, err= %s\n", app.ID, err)
 		return
 	}
 	return flinkOverview
 }
 
 // GetJobManangerAddr get IP and port of one JobManager
-func GetJobManangerAddr(appID string) (jobManager Host) {
+func GetJobManangerAddr(app App) (jobManager Host) {
 	result := make([]Object, 0)
 	// Get IP from config
-	req, err := newGetRequest("/proxy/" + appID + "/jobmanager/config")
+	req, err := newProxyRequest(app, "/jobmanager/config")
 	if err != nil {
 		log.Println(err)
 		return
@@ -436,7 +574,7 @@ func GetJobManangerAddr(appID string) (jobManager Host) {
 
 	err = do(ctx, req, &result)
 	if err != nil {
-		log.Printf("Error unmarshalling JobManager address, id= %s, err= %s\n", appID, err)
+		log.Printf("Error unmarshalling JobManager address, id= %s, err= %s\n", app.ID, err)
 		return
 	}
 
@@ -448,7 +586,7 @@ func GetJobManangerAddr(appID string) (jobManager Host) {
 	}
 
 	// Get exporter port from log
-	req, err = newGetRequest("/proxy/" + appID + "/jobmanager/log")
+	req, err = newProxyRequest(app, "/jobmanager/log")
 	if err != nil {
 		log.Println(err)
 		return
@@ -489,7 +627,7 @@ func GetJobManangerAddr(appID string) (jobManager Host) {
 // GetAppAttemptList ...
 func GetAppAttemptList(appID string) (attempts []Attempt) {
 	var attemptResp AttemptResponse
-	req, err := newGetRequest("/ws/v1/cluster/apps/" + appID + "/appattempts")
+	req, err := newGetRequest("/v1/cluster/apps/" + appID + "/appattempts")
 	if err != nil {
 		log.Println(err)
 		return
@@ -509,11 +647,11 @@ func GetAppAttemptList(appID string) (attempts []Attempt) {
 }
 
 // GetTaskManagerList gets list of Flink apps from YARN
-func GetTaskManagerList(appID string) (taskManagers []TaskManager) {
+func GetTaskManagerList(app App) (taskManagers []TaskManager) {
 	tmRespsone := TMResponse{}
 	tmRespsone.List = make([]TaskManager, 0)
 
-	req, err := newGetRequest("/proxy/" + appID + "/taskmanagers")
+	req, err := newProxyRequest(app, "/taskmanagers")
 	if err != nil {
 		log.Println(err)
 		return
@@ -526,14 +664,14 @@ func GetTaskManagerList(appID string) (taskManagers []TaskManager) {
 
 	err = do(ctx, req, &tmRespsone)
 	if err != nil {
-		log.Printf("Error when unmarshall TaskManger address list, id= %s, err= %s\n", appID, err)
+		log.Printf("Error when unmarshall TaskManger address list, id= %s, err= %s\n", app.ID, err)
 		return nil
 	}
 	return tmRespsone.List
 }
 
 // GetTaskManangerAddr reads task manager log and check for prometheus exporter IP:port
-func GetTaskManangerAddr(appID string, tm TaskManager, result chan Host, waitGroup *sync.WaitGroup) {
+func GetTaskManangerAddr(app App, tm TaskManager, result chan Host, waitGroup *sync.WaitGroup) {
 	defer waitGroup.Done()
 	// Get domain name
 	tmAddr := Host{}
@@ -548,7 +686,7 @@ func GetTaskManangerAddr(appID string, tm TaskManager, result chan Host, waitGro
 	tmAddr.IP = host
 
 	// Get exporter port from log
-	req, err := newGetRequest("/proxy/" + appID + "/taskmanagers/" + tm.ID + "/log")
+	req, err := newProxyRequest(app, "/taskmanagers/" + tm.ID + "/log")
 	if err != nil {
 		log.Println("Failed when make request, err= ", err)
 		result <- tmAddr
@@ -591,22 +729,6 @@ func GetTaskManangerAddr(appID string, tm TaskManager, result chan Host, waitGro
 	result <- tmAddr
 }
 
-func newGetRequest(path string) (*http.Request, error) {
-	url := *yarnAddr + path
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Accept", "application/json")
-
-	if *bearerToken != "" {
-		req.Header.Set("Authorization", "Bearer "+*bearerToken)
-	} else if *basicUser != "" {
-		req.SetBasicAuth(*basicUser, *basicPass)
-	}
-	return req, nil
-}
-
 func do(ctx context.Context, req *http.Request, v interface{}) error {
 	req = req.WithContext(ctx)
 	resp, err := sharedClient.Do(req)
@@ -620,13 +742,31 @@ func do(ctx context.Context, req *http.Request, v interface{}) error {
 	}
 	defer resp.Body.Close()
 
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("error reading response body: %w", err)
+	}
+
+	if *debugMode {
+		log.Printf("[DEBUG] %s %s => status=%d body=%s\n", req.Method, req.URL, resp.StatusCode, string(body))
+	}
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("unexpected status %d: %s", resp.StatusCode, string(body))
+	}
+
+	if len(body) == 0 {
+		return fmt.Errorf("empty response body (status %d) for %s", resp.StatusCode, req.URL)
+	}
+
 	if v != nil {
-		if err = json.NewDecoder(resp.Body).Decode(v); err != nil {
-			return err
+		if err = json.Unmarshal(body, v); err != nil {
+			return fmt.Errorf("json decode error: %w, body: %s", err, string(body))
 		}
 	}
 	return nil
 }
+
 
 func resolveDomainToIP(hostList []Host) (result []Host) {
 	if len(hostList) == 0 {
