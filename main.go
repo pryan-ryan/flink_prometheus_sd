@@ -317,8 +317,12 @@ func buildKerberosClient() *http.Client {
     // spnego.NewClient requires an *http.Client, not *http.Transport
     baseClient := &http.Client{
         Transport: &http.Transport{TLSClientConfig: tlsCfg},
+        CheckRedirect: func(req *http.Request, via []*http.Request) error {
+            return http.ErrUseLastResponse
+        },
     }
     spnegoClient := spnego.NewClient(krb5Client, baseClient, "")
+
 
     return &http.Client{
         Timeout:   time.Second * time.Duration(*queryTimeout),

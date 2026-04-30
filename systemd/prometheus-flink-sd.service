@@ -6,12 +6,16 @@ User=prometheus
 Group=prometheus
 Restart=always
 Type=simple
-ExecStart=/etc/prometheus/prometheus_flink_sd/prometheus_flink_sd \
-        -address yarnapi.test.com:8088 \
+ExecStart=/opt/prometheus/prometheus_flink_sd \
+        -address https://pr-flink-master1.se-sandb.a465-9q4k.cloudera.site:8090/ws \
         -poll-interval 30 \
         -timeout 20 \
-        -folder /etc/prometheus/prometheus_flink_sd/targets/ \
-        -log-file /etc/prometheus/prometheus_flink_sd/flink_sd.log
-        
+        -folder /etc/prometheus/cdp_flink_targets/ \
+        -log-file /var/log/prometheus/flink_sd.log \
+        -tls-skip-verify \
+        -use-kerberos \
+        -keytab /etc/prometheus/keytabs/se-sandbox-aws-srv_prometheus.keytab \
+        -principal srv_prometheus@SE-SANDB.A465-9Q4K.CLOUDERA.SITE
+
 [Install]
 WantedBy=multi-user.target
