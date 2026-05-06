@@ -133,7 +133,6 @@ var (
 	// Auth
 	basicUser       = flag.String("username", "", "Basic auth username")
 	basicPass       = flag.String("password", "", "Basic auth password")
-	bearerToken     = flag.String("token", "", "Bearer token for Authorization header")
 	// TLS
 	tlsCACert       = flag.String("tls-ca-cert", "", "Path to CA certificate")
 	tlsClientCert   = flag.String("tls-client-cert", "", "Path to client certificate")
@@ -143,10 +142,8 @@ var (
 	kerberosKeytab     = flag.String("keytab", "", "Path to Kerberos keytab file")
 	kerberosPrincipal  = flag.String("principal", "", "Kerberos principal e.g. user@REALM")
 	krb5ConfPath       = flag.String("krb5-conf", "/etc/krb5.conf", "Path to krb5.conf")
-	// New flags (add to var block)
-	yarnTimelineHost  = flag.String("yarn-timeline-host", "", "YARN Timeline Server host for log access (defaults to Knox host)")
-	yarnTimelinePort  = flag.String("yarn-timeline-port", "19890", "YARN Timeline Server port")
-	knoxTopologyPath  = flag.String("knox-log-path", "/cdp-proxy-api/yarnuiv2/timeline", "Knox path to yarnuiv2 timeline topology")
+    yarnProxyAddr = flag.String("proxy-address", "", "Knox YARNUIV2 base URL e.g. https://knox-host/gateway/cdp-proxy/yarnuiv2")
+
 )
 
 func main() {
@@ -188,61 +185,43 @@ func main() {
 		os.Exit(0)
 	}
 
-	// Service mode
-	var curApps, prevApps, addedApps, removedApps []App
-	ticker := time.NewTicker(time.Second * time.Duration(*pollInterval))
-	for range ticker.C {
-		curApps = GetListFlinkApps()
+// Service mode
+    var curApps, prevApps []App
+    ticker := time.NewTicker(time.Second * time.Duration(*pollInterval))
+    for range ticker.C {
+        curApps = GetListFlinkApps()
 
-		for i, app := range curApps {
-			attempts := GetAppAttemptList(app.ID)
-			curApps[i].LastAttemptID = getMaxAttemptID(attempts)
-		}
+        for i, app := range curApps {
+            attempts := GetAppAttemptList(app.ID)
+            curApps[i].LastAttemptID = getMaxAttemptID(attempts)
+        }
 
-		if len(prevApps) != 0 {
-			addedApps = difference(curApps, prevApps)
-			removedApps = difference(prevApps, curApps)
-			for i := range curApps {
-				for j := range prevApps {
-					if curApps[i].ID == prevApps[j].ID {
-						appID := curApps[i].ID
-						curLastAttemptID := curApps[i].LastAttemptID
-						prevLastAttemptID := prevApps[j].LastAttemptID
-						if curLastAttemptID > prevLastAttemptID {
-							log.Println("---- Update status ----")
-							log.Println("Running apps: ", len(curApps))
-							log.Printf("Detected change in existing app. AppID: %s - (AttemptID: %d => %d)\n", appID, prevLastAttemptID, curLastAttemptID)
-							CreateJSONFile(curApps[i])
-						}
-					}
-				}
-			}
-		} else {
-			addedApps = curApps
-		}
+        // Delete files for apps no longer running
+        for _, prev := range prevApps {
+            found := false
+            for _, cur := range curApps {
+                if cur.ID == prev.ID {
+                    found = true
+                    break
+                }
+            }
+            if !found {
+                removeJSONFile(prev.ID)
+            }
+        }
 
-		if len(addedApps)+len(removedApps) > 0 {
-			log.Println("---- Update status ----")
-			log.Println("Running apps: ", len(curApps))
-			log.Println("New apps: ", len(addedApps))
-			log.Println("Removed apps: ", len(removedApps))
+        // Write/update file for each current app
+        for _, app := range curApps {
+            if *debugMode {
+                CreateJSONFile(app)
+            } else {
+                go CreateJSONFile(app)
+            }
+        }
 
-			for _, app := range addedApps {
-				if *debugMode {
-					CreateJSONFile(app)
-					continue
-				}
-				go CreateJSONFile(app)
-			}
-			for _, app := range removedApps {
-				removeJSONFile(app.ID)
-			}
-		}
-		prevApps = curApps
-	}
+        prevApps = curApps
+    }
 }
-
-//shared client builder
 func buildHTTPClient() *http.Client {
 	tlsCfg := &tls.Config{
 		InsecureSkipVerify: *tlsSkipVerify,
@@ -350,11 +329,7 @@ func newGetRequest(path string) (*http.Request, error) {
     }
     req.Header.Set("Accept", "application/json")
     if !*useKerberos {
-        if *bearerToken != "" {
-            req.Header.Set("Authorization", "Bearer "+*bearerToken)
-        } else if *basicUser != "" {
             req.SetBasicAuth(*basicUser, *basicPass)
-        }
     }
     return req, nil
 }
@@ -367,16 +342,20 @@ func newProxyRequest(app App, path string) (*http.Request, error) {
             return nil, fmt.Errorf("failed to parse yarnAddr: %w", err)
         }
         rawURL = u.Scheme + "://" + u.Host + "/proxy/" + app.ID + path
+    } else if *yarnProxyAddr != "" {
+        // Use explicit YARNUIV2 Knox endpoint
+        base := strings.TrimRight(*yarnProxyAddr, "/")
+        rawURL = base + "/proxy/" + app.ID + path
     } else {
+        // Fallback: use TrackingURL from YARN app response
         base, err := url.Parse(app.TrackingURL)
         if err != nil {
             return nil, fmt.Errorf("failed to parse trackingUrl: %w", err)
         }
         proxyURL := &url.URL{
-            Scheme:   base.Scheme,
-            Host:     base.Host,
-            Path:     strings.TrimRight(base.Path, "/") + path,
-            RawQuery: base.RawQuery,
+            Scheme: base.Scheme,
+            Host:   base.Host,
+            Path:   strings.TrimRight(base.Path, "/") + path,
         }
         rawURL = proxyURL.String()
     }
@@ -387,11 +366,7 @@ func newProxyRequest(app App, path string) (*http.Request, error) {
     }
     req.Header.Set("Accept", "application/json")
     if !*useKerberos {
-        if *bearerToken != "" {
-            req.Header.Set("Authorization", "Bearer "+*bearerToken)
-        } else if *basicUser != "" {
             req.SetBasicAuth(*basicUser, *basicPass)
-        }
     }
     return req, nil
 }
@@ -858,7 +833,7 @@ func difference(slice1, slice2 []App) []App {
 	for _, e1 := range slice1 {
 		found := false
 		for _, e2 := range slice2 {
-			if e1 == e2 {
+			if e1.ID == e2.ID {
 				found = true
 				break
 			}

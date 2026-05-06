@@ -1,0 +1,21 @@
+[Unit]
+Description=Prometheus Flink Service Discovery
+
+[Service]
+User=prometheus
+Group=prometheus
+Restart=always
+Type=simple
+ExecStart=/opt/prometheus/prometheus_flink_sd \
+        -address https://pr-flink-manager0.se-sandb.a465-9q4k.cloudera.site/pr-flink/cdp-proxy-api/resourcemanager/  \
+        -proxy-address https://pr-flink-manager0.se-sandb.a465-9q4k.cloudera.site/pr-flink/cdp-proxy-api/yarnuiv2/  \
+        -poll-interval 30 \
+        -timeout 20 \
+        -folder /etc/prometheus/cdp_flink_targets/ \
+        -log-file /var/log/prometheus/flink_sd.log \
+        -tls-skip-verify \
+        -username pryan\
+        -password 'Cloudera123!'
+
+[Install]
+WantedBy=multi-user.target
